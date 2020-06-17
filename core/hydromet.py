@@ -144,7 +144,8 @@ def build_precip_table(geo_df: geoDF, all_zips_list: list, noaa_url: str,
             with open(local_file_disk, 'wb') as asc:
                 asc.write(content)
         grid_data = parse_filename(zip_name, vol_code)
-        grid_data['value'] = get_masked_mean_atlas14(geo_df, local_file_disk)    
+        #grid_data['value'] = get_masked_mean_atlas14(geo_df, local_file_disk)  
+        grid_data['value'] = get_masked_centroid_atlas14(geo_df, local_file_disk)
         results.append(grid_data)
         os.remove(local_file_disk)
         if verbose: print(i, zip_name)
@@ -182,6 +183,15 @@ def get_masked_mean_atlas14(gdf: geoDF, raster: str) -> float:
     mean_m = region_mean*0.001    
     return mean_m
 
+def get_masked_centroid_atlas14(gdf: geoDF, raster: str) -> float:
+    '''Samples the Atlas 14 precipitation raster at the centroid 
+       to obtain the the precipitation value in inches.
+    '''
+    with rasterio.open(raster) as src:
+        region_centroid = src.sample([(gdf.centroid.x[0],gdf.centroid.y[0])])
+        for val in region_centroid:
+            centroid_m = val.max()*0.001    
+    return centroid_m
 
 def get_input_data(precip_table_dir: str, duration: int, lower_limit: int=2,
                                  display_print: bool=True) -> pd.DataFrame:
@@ -2018,6 +2028,113 @@ def plot_incr_excess(df: pd.DataFrame) -> None:
     ax.set_xlabel('Time (hours)', fontsize = 18)
     ax.set_ylabel('Incremental Excess (inches)', fontsize=18)
     ax.grid()
+
+def precip_hyetograph_nrcs(df : pd.DataFrame) -> pd.DataFrame:
+    '''set variables
+    '''
+    time_range = {'time':np.arange(start =0, stop = 241,step = 1)}
+    ratio_to_24h = pd.DataFrame(time_range,columns = ['time']).set_index(['time'])
+
+    '''step 1 get ratio of rainfall, and incremental intensity
+    '''
+    dif = df.diff()
+    dif.at['05m','value'] = df.at['05m','value']
+    df['ratio'] = df/df.at['24h','value']
+    i_val = {'05m': 12, '10m': 12, '15m': 12, '30m': 4, '60m': 2,
+             '02h': 1, '03h': 1, '06h': 1/3, '12h': 1/6, '24h': 1/12}
+    intensity_val = pd.DataFrame.from_dict(i_val,orient='index')
+    df.insert(1,'increm_intensity',dif['value']*intensity_val[0],True)
+
+    '''step 2: get ratio, slope, and slope difference
+    '''
+    raw_rf = {'time':[0,6,9,10.5,11,11.5,11.75,11.875,11.917,12,12.083,12.125,
+                      12.25,12.5,13,13.5,15,18,24]
+              }
+    raw_df = pd.DataFrame(raw_rf, columns = ['time'])
+    temp_0 = 0.5 - df.sort_values('ratio',ascending=False)['ratio']*.5
+    temp_12 = 0.5
+    temp_24 = 1- temp_0.sort_values(0,ascending=False)
+    raw_df['ratio'] = ""
+    raw_df.loc[0:9,'ratio']= temp_0.values
+    raw_df.loc[9:18,'ratio'] = temp_24.values
+    raw_df.loc[9,'ratio'] = temp_12
+    raw_df['slope_raw'] = raw_df['ratio'].diff() / raw_df['time'].diff()
+    raw_df.loc[0,'slope_raw'] = 0
+    raw_df['slope_dif'] = raw_df.loc[0:9]['slope_raw'].diff()
+
+    '''fit parabolic curvefrom 0 to 9 hours that passes through the ratios at 0
+    , 6, and 9 hours'''
+    df2 = raw_df.set_index(['time'])
+    a = ((2/3)* df2.at[9.0,'ratio']-df2.at[6.0,'ratio'])/18
+    b = (df2.at[6.0,'ratio']-36* a)/6
+    low_12h = 4 * df.loc['24h','value']*(1/36 +2/9 * df.loc['06h','value']/df.loc['24h','value'])
+    up_12h = 2/3 * df.loc['24h','value']*(5/6+2/3 * df.loc['06h','value']/df.loc['24h','value'])
+    ##fix negatives
+    if b < 0:
+        0
+    if a < 0:
+        df2.at[9.0,'ratio']/81
+    ##fix 0 slope
+    if 18*a+b<0:
+        df2.at[9.0,'ratio']/4.5
+    if 18*a+b<0:
+        (-1*b/18)
+    a2 = (9/10.5* df2.at[10.5,'ratio'] - df2.at[9.0,'ratio'])/13.5
+    b2 = (df2.at[9.0,'ratio'] -81 *a2) / 9
+    ##check 2h rainfall
+    up_2 = 2* df.loc['24h','value']*(0.5-(df2.at[11.5,'ratio']+ 3*df2.at[10.5,'ratio'])/4)+.01
+    low_2 = 2* df.loc['24h','value']*(0.5-(3*df2.at[11.5,'ratio']+df2.at[10.5,'ratio'])/4)+.01
+    if df.loc['02h','value']<low_2:
+        test1 = low_2
+    else:
+        test1 = df.loc['02h','value']
+    if df.loc['02h','value']> up_2:
+        test2= up_2
+    else:
+        test2 = df.loc['02h','value']
+    if test1 > test2:
+        test3 = test1
+    else:
+        test3 = test2
+    if test2 > test3:
+        test4 = test2
+    else:
+        test4 = test3
+    if test4>up_2:
+        test_f = up_2
+    else:
+        test_f = test4
+    a3 = 2*(df2.at[11.5,'ratio'] - 2*(0.5-0.5* test_f / df.loc['24h','value'])+ df2.at[10.5,'ratio'])
+    b3 = df2.at[11.5,'ratio']- df2.at[10.5,'ratio'] - 22*a3
+    c3 = (0.5 - 0.5 * test_f /df.loc['24h','value']) - 121* a3 - 11 * b3
+    
+
+    
+    ##write ratios
+    ratio_to_24h['ratio'] = 0
+    ratio_to_24h.loc[0:90,'ratio'] = a*np.power(ratio_to_24h.loc[0:90].index/10,2)+b*ratio_to_24h.loc[0:90].index/10
+    ratio_to_24h.loc[91:105,'ratio'] = a2*np.power(ratio_to_24h.loc[91:105].index/10,2)+ b2*ratio_to_24h.loc[91:105].index/10
+    ratio_to_24h.loc[106:115,'ratio'] = a3*np.power(ratio_to_24h.loc[106:115].index/10,2)+ b3*ratio_to_24h.loc[106:115].index/10 + c3
+    ##extra work to get 11.6,11.7
+    ratio_to_24h['slope'] = ratio_to_24h['ratio'].diff()/0.1                                                               
+    if -0.867*ratio_to_24h.loc[115,'slope']+ 0.4337 < 0.399: 
+        fac_116 = -0.867*ratio_to_24h.loc[115,'slope']+ 0.4337
+    else:
+        fac_116 = 0.399
+    if -0.4917*ratio_to_24h.loc[115,'slope']+ 0.8182 < 0.799: 
+        fac_117 = -0.4917*ratio_to_24h.loc[115,'slope']+ 0.8182
+    else:
+        fac_116 = 0.799
+    ratio_to_24h.at[116,'ratio'] = df2.at[11.5,'ratio'] + fac_116 *(df2.at[11.75,'ratio']-df2.at[11.5,'ratio'])
+    ratio_to_24h.at[117,'ratio'] = df2.at[11.5,'ratio'] + fac_117 *(df2.at[11.75,'ratio']-df2.at[11.5,'ratio'])                                                                                                                
+    ratio_to_24h.at[118,'ratio'] = df2.at[11.75,'ratio'] + 0.4*(df2.at[11.875,'ratio']-df2.at[11.75,'ratio'])
+    ratio_to_24h.at[119,'ratio'] = df2.at[11.875,'ratio'] + 0.6*(df2.at[11.917,'ratio']-df2.at[11.875,'ratio'])
+    ratio_to_24h.loc[121:240,'ratio'] = 1 - ratio_to_24h.loc[0:119,'ratio'].sort_index(ascending=False).values
+    ratio_to_24h.loc[120,'ratio'] = ratio_to_24h.at[121,'ratio'] - (df.at['05m','ratio'] +1/5*(df.at['10m','ratio']-df.at['05m','ratio']))
+    ratio_to_24h.loc[0,'ratio'] = 0
+    ratio_to_24h['slope'] = ratio_to_24h['ratio'].diff()/0.1
+    ratio_to_24h['t_step'] = ratio_to_24h.index*.1
+    return ratio_to_24h
 
 
 #---------------------------------------------------------------------------#
